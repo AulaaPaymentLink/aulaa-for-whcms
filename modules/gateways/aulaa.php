@@ -1,14 +1,17 @@
 <?php
 /**
- * Modul Payment Gateway Aulaa untuk WHMCS.
+ * Modul Payment Link Aulaa untuk WHMCS.
  *
- * Mengintegrasikan pembayaran serbaguna Aulaa (QRIS, Virtual Account, E-Wallet,
- * dan Gerai Retail) ke dalam sistem penagihan WHMCS.
+ * Mengintegrasikan layanan payment link Aulaa (QRIS, Virtual Account, E-Wallet,
+ * Alfamart/Indomaret, dan kartu kredit/debit) ke dalam sistem penagihan WHMCS.
+ * Pembayaran selalu diselesaikan di halaman pembayaran Aulaa, dan modul ini
+ * mengarahkan pelanggan ke `payment_link` yang dikembalikan API Aulaa.
  *
  * @package    Aulaa_WHMCS
  * @author     Aulaa.co
  * @copyright  2026 Aulaa.co
  * @license    MIT
+ * @link       https://aulaa.co/dokumentasi
  */
 
 if (!defined("WHMCS")) {
@@ -25,7 +28,7 @@ use WHMCS\Config\Setting;
 function aulaa_MetaData()
 {
     return [
-        'DisplayName'                 => 'Aulaa Payment Gateway',
+        'DisplayName'                 => 'Aulaa Payment Link',
         'APIVersion'                  => '1.1',
         'DisableLocalCreditCardInput' => true,
         'TokenisedStorage'            => false,
@@ -46,35 +49,39 @@ function aulaa_config()
     return [
         'FriendlyName' => [
             'Type'  => 'System',
-            'Value' => 'Aulaa (QRIS, Virtual Account, E-Wallet)',
+            'Value' => 'Aulaa (QRIS, Virtual Account, E-Wallet, Kartu)',
         ],
         'apiKey' => [
             'FriendlyName' => 'API Key',
             'Type'         => 'password',
             'Size'         => '50',
             'Default'      => '',
-            'Description'  => 'API Key project Aulaa Anda (misal: <code>pgw_id_...</code>). Ambil dari Dashboard Aulaa &rarr; Project Settings.',
+            'Description'  => 'API Key project Aulaa Anda (format <code>pgw_id_...</code>). Ambil dari Dashboard Aulaa &rarr; Projects &rarr; bagian API Keys. '
+                              . '<strong>Project harus bertipe API</strong> &mdash; project tipe No-Code tidak bisa memakai API.',
         ],
         'webhookSecret' => [
             'FriendlyName' => 'Webhook Secret',
             'Type'         => 'password',
             'Size'         => '50',
             'Default'      => '',
-            'Description'  => 'Webhook Secret project Aulaa. Digunakan untuk memverifikasi keaslian signature HMAC-SHA256 dari webhook notifikasi.',
+            'Description'  => 'Webhook Secret project Aulaa (Dashboard Aulaa &rarr; Projects &rarr; bagian Webhook). '
+                              . 'Dipakai memverifikasi signature HMAC-SHA256 webhook, sekaligus menandatangani link bayar di halaman invoice.',
         ],
         'apiBase' => [
             'FriendlyName' => 'API Base URL',
             'Type'         => 'text',
             'Size'         => '50',
             'Default'      => 'https://api.aulaa.co/v1',
-            'Description'  => 'Default: <code>https://api.aulaa.co/v1</code>. Jangan ubah kecuali menggunakan lingkungan staging.',
+            'Description'  => 'Default: <code>https://api.aulaa.co/v1</code>. Jangan ubah kecuali diminta oleh Aulaa.',
         ],
         'payBase' => [
-            'FriendlyName' => 'Payment Page URL',
+            'FriendlyName' => 'Payment Host',
             'Type'         => 'text',
             'Size'         => '50',
             'Default'      => 'https://payment.aulaa.co',
-            'Description'  => 'Default: <code>https://payment.aulaa.co</code>. Base URL halaman pembayaran yang dikunjungi pelanggan.',
+            'Description'  => 'Default: <code>https://payment.aulaa.co</code>. Host ini dipakai untuk <strong>memvalidasi</strong> '
+                              . '<code>payment_link</code> yang dikembalikan Aulaa sebelum pelanggan dialihkan, sebagai perlindungan open redirect. '
+                              . 'URL halaman pembayaran sendiri selalu berasal dari response API, bukan dirakit oleh modul ini.',
         ],
         'autoRedirect' => [
             'FriendlyName' => 'Otomatis Alihkan (Auto Redirect)',
@@ -85,20 +92,23 @@ function aulaa_config()
             'FriendlyName' => 'Konfigurasi Webhook di Aulaa',
             'Type'         => 'textarea',
             'Rows'         => '3',
-            'Description'  => 'Salin URL Callback berikut dan tempelkan pada kolom <strong>Callback URL</strong> di dashboard Aulaa:<br><code style="font-size:13px; color:#2563eb; user-select:all;">' . htmlspecialchars($callbackUrl) . '</code>',
+            'Description'  => 'Salin URL berikut ke kolom <strong>Callback URL</strong> project Anda di Dashboard Aulaa '
+                              . '(Projects &rarr; bagian Webhook):<br>'
+                              . '<code style="font-size:13px; color:#2563eb; user-select:all;">' . htmlspecialchars($callbackUrl) . '</code>'
+                              . '<br><small>Mengganti callback URL pada project yang sudah <em>approved</em> memicu review ulang oleh Aulaa.</small>',
         ],
     ];
 }
 
 /**
- * Menghasilkan HTML tombol/form pembayaran pada halaman tagihan klien (viewinvoice.php).
+ * Menghasilkan HTML tombol pembayaran pada halaman tagihan klien (viewinvoice.php).
  *
- * @param array $params Parameter invoice dan konfigurasi gateway yang disediakan WHMCS
+ * @param array $params Parameter invoice dan konfigurasi gateway dari WHMCS
  * @return string HTML formulir pembayaran
  */
 function aulaa_link($params)
 {
-    // Validasi mata uang: Aulaa hanya mendukung transaksi Rupiah (IDR)
+    // Aulaa memproses transaksi dalam Rupiah saja
     $currency = strtoupper((string)($params['currency'] ?? ''));
     if ($currency !== 'IDR') {
         return '<div class="alert alert-warning" style="margin:10px 0; text-align:left; font-size:13px;">' .
@@ -109,21 +119,25 @@ function aulaa_link($params)
     }
 
     $invoiceId     = (int)$params['invoiceid'];
-    $amount        = $params['amount'];
     $webhookSecret = (string)($params['webhookSecret'] ?? '');
     $systemUrl     = rtrim($params['systemurl'], '/') . '/';
     $redirectUrl   = $systemUrl . 'modules/gateways/aulaa/redirect.php';
     $autoRedirect  = !empty($params['autoRedirect']);
 
-    // Buat tanda tangan HMAC untuk mengamankan link checkout dari manipulasi ID invoice
-    $token = hash_hmac('sha256', $invoiceId . '|' . $amount, $webhookSecret);
-
     $html = '<div class="aulaa-payment-box" style="margin: 10px 0; text-align: center;">';
     $html .= '<form id="aulaa-pay-form" method="POST" action="' . htmlspecialchars($redirectUrl) . '">';
     $html .= '<input type="hidden" name="invoiceid" value="' . $invoiceId . '" />';
-    $html .= '<input type="hidden" name="token" value="' . htmlspecialchars($token) . '" />';
 
-    // Tombol Bayar dengan gaya modern Aulaa
+    // Signed token mengesahkan bahwa link bayar ini memang diterbitkan oleh modul
+    // untuk invoice tersebut, sehingga pelanggan yang belum login pun bisa
+    // melanjutkan pembayaran tanpa membuka celah manipulasi ID invoice.
+    // Nominal tidak ikut ditandatangani karena redirect.php selalu menghitung
+    // ulang sisa tagihan dari database, bukan dari request.
+    if ($webhookSecret !== '') {
+        $token = hash_hmac('sha256', 'aulaa|invoice|' . $invoiceId, $webhookSecret);
+        $html .= '<input type="hidden" name="token" value="' . htmlspecialchars($token) . '" />';
+    }
+
     $html .= '<button type="submit" class="btn btn-primary btn-lg" style="' .
         'background-color: #2563eb; border-color: #1d4ed8; color: #ffffff; ' .
         'padding: 10px 22px; font-weight: 600; border-radius: 8px; font-size: 15px; ' .
@@ -138,16 +152,15 @@ function aulaa_link($params)
         '</button>';
 
     $html .= '<div style="margin-top: 8px; font-size: 12px; color: #6b7280;">' .
-        'QRIS &bull; Virtual Account &bull; E-Wallet' .
+        'QRIS &bull; Virtual Account &bull; E-Wallet &bull; Alfamart/Indomaret &bull; Kartu' .
         '</div>';
 
     $html .= '</form>';
 
-    // Fitur auto-redirect jika diaktifkan di admin
     if ($autoRedirect) {
         $html .= '<div id="aulaa-redirect-notice" style="margin-top: 10px; font-size: 13px; color: #4b5563;">' .
             '<div class="spinner-border spinner-border-sm text-primary" role="status" style="margin-right: 5px; width: 14px; height: 14px; border-width: 2px;"></div>' .
-            'Mengarahkan otomatis ke sistem pembayaran Aulaa... ' .
+            'Mengarahkan otomatis ke halaman pembayaran Aulaa... ' .
             '<small style="display:block; color:#9ca3af; margin-top:2px;">(Jika tidak beralih otomatis dalam beberapa detik, klik tombol di atas)</small>' .
             '</div>';
         $html .= '<script type="text/javascript">

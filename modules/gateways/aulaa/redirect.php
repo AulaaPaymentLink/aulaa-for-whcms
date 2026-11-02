@@ -1,15 +1,23 @@
 <?php
 /**
- * Handler Redirect Checkout Aulaa untuk WHMCS.
+ * Handler Checkout Aulaa untuk WHMCS.
  *
- * Menerima permintaan bayar dari viewinvoice.php, memvalidasi otentikasi/token,
- * membuat invoice transaksi di Aulaa API, lalu mengarahkan browser pelanggan
- * ke halaman pembayaran hosted Aulaa (https://payment.aulaa.co/pay/{id}).
+ * Menerima permintaan bayar dari viewinvoice.php, memvalidasi otentikasi,
+ * membuat transaksi di Aulaa lewat `POST /v1/payments`, lalu mengarahkan
+ * browser pelanggan ke `payment_link` yang dikembalikan Aulaa.
+ *
+ * Catatan penting soal idempotensi: `order_id` dibuat stabil per invoice WHMCS.
+ * Dokumentasi Aulaa melarang membuat `order_id` baru untuk pesanan yang sama
+ * karena pelanggan bisa tertagih dua kali. Bila `order_id` sudah terpakai,
+ * Aulaa menjawab 409 Conflict beserta `payment_id` transaksi yang sudah ada;
+ * modul ini membaca status transaksi itu dan melanjutkan sesi pembayaran yang
+ * sama bila masih `pending`.
  *
  * @package    Aulaa_WHMCS
  * @author     Aulaa.co
  * @copyright  2026 Aulaa.co
  * @license    MIT
+ * @link       https://aulaa.co/dokumentasi/api-v1/buat-pembayaran
  */
 
 require_once __DIR__ . '/../../../init.php';
@@ -18,6 +26,11 @@ use WHMCS\Database\Capsule;
 
 App::load_function('gateway');
 App::load_function('invoice');
+
+require_once __DIR__ . '/lib/AulaaApi.php';
+
+/** @var int Berapa banyak order_id yang boleh dicoba bila transaksi lama sudah mati */
+const AULAA_MAX_ORDER_ATTEMPTS = 5;
 
 $gatewayModuleName = 'aulaa';
 $gatewayParams = getGatewayVariables($gatewayModuleName);
@@ -30,106 +43,247 @@ if (!$gatewayParams['type']) {
 $invoiceId = (int)($_GET['invoiceid'] ?? $_POST['invoiceid'] ?? 0);
 $token     = (string)($_GET['token'] ?? $_POST['token'] ?? '');
 
-// Pastikan parameter invoice ID ada
 if ($invoiceId <= 0) {
     http_response_code(400);
     die("Parameter ID Invoice tidak valid.");
 }
 
-// Ambil data invoice dari database WHMCS
 $invoice = Capsule::table('tblinvoices')->where('id', $invoiceId)->first();
 if (!$invoice) {
     http_response_code(404);
-    die("Invoice #" . htmlspecialchars($invoiceId) . " tidak ditemukan.");
+    die("Invoice #" . htmlspecialchars((string)$invoiceId) . " tidak ditemukan.");
 }
 
-// Jika invoice sudah lunas, langsung kembalikan ke viewinvoice
-if (strtolower($invoice->status) === 'paid') {
-    header("Location: " . $gatewayParams['systemurl'] . "viewinvoice.php?id=" . $invoiceId);
+$systemUrl   = rtrim($gatewayParams['systemurl'], '/') . '/';
+$invoiceUrl  = $systemUrl . 'viewinvoice.php?id=' . $invoiceId;
+
+// Invoice yang sudah lunas tidak perlu transaksi baru
+if (strtolower((string)$invoice->status) === 'paid') {
+    header("Location: " . $invoiceUrl);
     exit;
 }
 
-// Validasi otentikasi: Pelanggan yang login ATAU memiliki valid signed HMAC token
-$expectedToken = hash_hmac('sha256', $invoice->id . '|' . $invoice->total, (string)$gatewayParams['webhookSecret']);
+// Validasi otentikasi: pelanggan yang login sebagai pemilik invoice, ATAU
+// pembawa signed token yang kita terbitkan sendiri di aulaa_link().
+$webhookSecret = (string)($gatewayParams['webhookSecret'] ?? '');
 $isUserOwner   = (isset($_SESSION['uid']) && (int)$_SESSION['uid'] === (int)$invoice->userid);
-$isTokenValid  = (!empty($token) && hash_equals($expectedToken, $token));
+$isTokenValid  = false;
+
+if ($webhookSecret !== '' && $token !== '') {
+    $expectedToken = hash_hmac('sha256', 'aulaa|invoice|' . (int)$invoice->id, $webhookSecret);
+    $isTokenValid  = hash_equals($expectedToken, $token);
+}
 
 if (!$isUserOwner && !$isTokenValid) {
     http_response_code(403);
     die("Akses ditolak: Verifikasi token otentikasi tidak sah.");
 }
 
-// Hitung sisa tagihan yang belum dibayar (balance due)
+// Hitung sisa tagihan yang belum dibayar
 $paidAmount = (float)Capsule::table('tblaccounts')->where('invoiceid', $invoiceId)->sum('amountin');
 $balanceDue = (float)$invoice->total - $paidAmount;
 $amount     = (int)round($balanceDue);
 
 if ($amount < 1) {
-    header("Location: " . $gatewayParams['systemurl'] . "viewinvoice.php?id=" . $invoiceId);
+    header("Location: " . $invoiceUrl);
     exit;
 }
 
-// Format order_id unik: whmcs-{invoiceId}-{randomHex}
-// Token acak memastikan jika pembayaran sebelumnya expired/dibatalkan, retry menghasilkan
-// invoice baru di Aulaa (tidak terkena HTTP 409 Conflict idempotency Aulaa).
-$randomSuffix = bin2hex(random_bytes(4));
-$orderRef     = 'whmcs-' . $invoiceId . '-' . $randomSuffix;
+// Host pembayaran yang diizinkan, dipakai untuk memvalidasi payment_link
+$payBase = !empty($gatewayParams['payBase']) ? (string)$gatewayParams['payBase'] : 'https://payment.aulaa.co';
+$payHost = (string)parse_url($payBase, PHP_URL_HOST);
+if ($payHost === '') {
+    // payBase mungkin diisi tanpa skema, mis. "payment.aulaa.co"
+    $payHost = trim(explode('/', preg_replace('#^[a-z0-9+.-]+://#i', '', trim($payBase)))[0]);
+}
 
-$systemUrl   = rtrim($gatewayParams['systemurl'], '/') . '/';
-$redirectUrl = $systemUrl . 'viewinvoice.php?id=' . $invoiceId;
-
-require_once __DIR__ . '/lib/AulaaApi.php';
+$baseOrderRef = 'whmcs-' . $invoiceId;
+$orderRef     = $baseOrderRef;
+$paymentLink  = '';
+$aulaaId      = '';
 
 try {
-    $apiBase = !empty($gatewayParams['apiBase']) ? $gatewayParams['apiBase'] : 'https://api.aulaa.co/v1';
-    $payBase = !empty($gatewayParams['payBase']) ? $gatewayParams['payBase'] : 'https://payment.aulaa.co';
+    $apiBase = !empty($gatewayParams['apiBase']) ? (string)$gatewayParams['apiBase'] : 'https://api.aulaa.co/v1';
 
-    $api = new AulaaApi($apiBase, $gatewayParams['apiKey']);
-    $res = $api->createPayment([
-        'order_id'     => $orderRef,
-        'amount'       => $amount,
-        'redirect_url' => $redirectUrl,
-    ]);
+    // Gagal cepat dengan pesan yang jelas bila nominal di luar batas Aulaa,
+    // tanpa menunggu 400 Bad Request dari server.
+    AulaaApi::assertAmountInRange($amount);
 
-    $invoiceAulaaId = $res['id'] ?? '';
-    if (empty($invoiceAulaaId)) {
-        throw new Exception("Respons dari Aulaa tidak menyertakan ID transaksi.");
+    $api = new AulaaApi($apiBase, (string)$gatewayParams['apiKey']);
+
+    for ($attempt = 1; $attempt <= AULAA_MAX_ORDER_ATTEMPTS; $attempt++) {
+        $orderRef = ($attempt === 1) ? $baseOrderRef : $baseOrderRef . '-r' . $attempt;
+
+        try {
+            $res = $api->createPayment([
+                'order_id'     => $orderRef,
+                'amount'       => $amount,
+                'redirect_url' => $invoiceUrl,
+            ]);
+
+            $aulaaId     = (string)($res['id'] ?? '');
+            $paymentLink = AulaaApi::extractPaymentLink($res, $payHost);
+
+            logTransaction(
+                $gatewayParams['name'],
+                [
+                    'action'         => 'create_payment',
+                    'whmcs_invoice'  => $invoiceId,
+                    'aulaa_order_id' => $orderRef,
+                    'aulaa_id'       => $aulaaId,
+                    'amount'         => $amount,
+                    'status'         => (string)($res['status'] ?? ''),
+                    'payment_link'   => $paymentLink,
+                    'expired_at'     => (string)($res['expired_at'] ?? ''),
+                    'is_test'        => !empty($res['is_test']) ? 'yes' : 'no',
+                ],
+                'Payment Initiated'
+            );
+            break;
+
+        } catch (AulaaApiException $e) {
+            // Selain 409, tidak ada yang bisa dipulihkan di sini
+            if ($e->getHttpCode() !== 409) {
+                throw $e;
+            }
+
+            $existingId = trim((string)$e->getBodyField('payment_id', ''));
+            if ($existingId === '') {
+                throw $e;
+            }
+
+            // order_id ini sudah dipakai. Baca transaksi yang sudah ada, lalu
+            // lanjutkan sesi pembayarannya bila masih bisa dibayar.
+            $existing = $api->getPayment($existingId);
+            $status   = strtolower(trim((string)($existing['status'] ?? '')));
+
+            if ($status === 'pending') {
+                $existingAmount = (int)($existing['amount'] ?? 0);
+
+                // Sesi lama hanya aman dilanjutkan bila nominalnya masih sama
+                // dengan sisa tagihan saat ini. Bila berbeda -- misalnya admin
+                // mencatat pembayaran manual sebagian setelah transaksi dibuat --
+                // link lama dibatalkan dulu supaya pelanggan tidak membayar
+                // nominal yang keliru dan tidak ada dua link aktif sekaligus.
+                if ($existingAmount !== $amount) {
+                    $api->cancelPayment($existingId);
+
+                    logTransaction(
+                        $gatewayParams['name'],
+                        [
+                            'action'          => 'cancel_stale_payment',
+                            'whmcs_invoice'   => $invoiceId,
+                            'aulaa_order_id'  => $orderRef,
+                            'aulaa_id'        => $existingId,
+                            'previous_amount' => $existingAmount,
+                            'current_amount'  => $amount,
+                            'note'            => 'Nominal tagihan berubah sejak transaksi dibuat. Transaksi lama '
+                                                 . 'dibatalkan, transaksi baru dibuat dengan nominal terkini.',
+                        ],
+                        'Stale Payment Cancelled'
+                    );
+                    continue;
+                }
+
+                $aulaaId     = $existingId;
+                $paymentLink = AulaaApi::extractPaymentLink($existing, $payHost);
+
+                logTransaction(
+                    $gatewayParams['name'],
+                    [
+                        'action'         => 'resume_payment',
+                        'whmcs_invoice'  => $invoiceId,
+                        'aulaa_order_id' => $orderRef,
+                        'aulaa_id'       => $aulaaId,
+                        'amount'         => $amount,
+                        'status'         => $status,
+                        'payment_link'   => $paymentLink,
+                        'expired_at'     => (string)($existing['expired_at'] ?? ''),
+                        'note'           => 'Melanjutkan sesi pembayaran yang masih pending (anti tagihan ganda).',
+                    ],
+                    'Payment Resumed'
+                );
+                break;
+            }
+
+            if ($status === 'paid') {
+                // Sudah dibayar di sisi Aulaa. Penandaan lunas adalah tugas
+                // webhook; jangan membuat transaksi kedua.
+                logTransaction(
+                    $gatewayParams['name'],
+                    [
+                        'action'         => 'already_paid',
+                        'whmcs_invoice'  => $invoiceId,
+                        'aulaa_order_id' => $orderRef,
+                        'aulaa_id'       => $existingId,
+                        'status'         => $status,
+                        'paid_at'        => (string)($existing['paid_at'] ?? ''),
+                        'note'           => 'Transaksi Aulaa sudah lunas. Bila invoice WHMCS masih unpaid, '
+                                            . 'periksa pengiriman webhook ke callback URL.',
+                    ],
+                    'Already Paid At Aulaa'
+                );
+
+                header("Location: " . $invoiceUrl);
+                exit;
+            }
+
+            // expired / cancelled / failed / refunded: transaksi lama sudah
+            // tertutup, jadi aman membuat transaksi baru dengan order_id berikutnya.
+            if (in_array($status, ['expired', 'cancelled', 'failed', 'refunded'], true)) {
+                logTransaction(
+                    $gatewayParams['name'],
+                    [
+                        'action'         => 'retry_new_order_id',
+                        'whmcs_invoice'  => $invoiceId,
+                        'aulaa_order_id' => $orderRef,
+                        'aulaa_id'       => $existingId,
+                        'status'         => $status,
+                        'attempt'        => $attempt,
+                    ],
+                    'Retrying (Previous ' . ucfirst($status) . ')'
+                );
+                continue;
+            }
+
+            // Status tidak dikenal: lebih baik berhenti daripada berisiko
+            // membuat tagihan kedua.
+            throw new AulaaApiException(sprintf(
+                'Transaksi Aulaa untuk order_id %s berstatus "%s" yang tidak dikenal modul ini. '
+                . 'Silakan hubungi dukungan Aulaa.',
+                $orderRef,
+                $status
+            ), 409, $existing);
+        }
     }
 
-    // Catat log pembuatan invoice
-    logTransaction(
-        $gatewayParams['name'],
-        [
-            'action'         => 'create_payment',
-            'whmcs_invoice'  => $invoiceId,
-            'aulaa_order_id' => $orderRef,
-            'aulaa_id'       => $invoiceAulaaId,
-            'amount'         => $amount,
-        ],
-        'Payment Initiated'
-    );
+    if ($paymentLink === '') {
+        throw new AulaaApiException(
+            'Tidak berhasil menyiapkan link pembayaran setelah ' . AULAA_MAX_ORDER_ATTEMPTS
+            . ' percobaan. Silakan coba beberapa saat lagi.'
+        );
+    }
 
-    // Redirect pelanggan ke halaman pembayaran Aulaa
-    $paymentUrl = rtrim($payBase, '/') . '/pay/' . rawurlencode($invoiceAulaaId);
-    header("Location: " . $paymentUrl);
+    // Arahkan pelanggan ke halaman pembayaran Aulaa
+    header("Location: " . $paymentLink, true, 303);
     exit;
 
 } catch (Exception $e) {
-    // Catat kegagalan ke Gateway Log WHMCS
     logTransaction(
         $gatewayParams['name'],
         [
-            'action'        => 'create_payment_error',
-            'whmcs_invoice' => $invoiceId,
-            'order_ref'     => $orderRef,
-            'error'         => $e->getMessage(),
+            'action'         => 'create_payment_error',
+            'whmcs_invoice'  => $invoiceId,
+            'aulaa_order_id' => $orderRef,
+            'amount'         => $amount,
+            'http_code'      => ($e instanceof AulaaApiException) ? $e->getHttpCode() : null,
+            'error'          => $e->getMessage(),
         ],
         'Payment Creation Failed'
     );
 
-    // Tampilkan halaman error yang rapi
     $errorMessage = htmlspecialchars($e->getMessage());
-    $invoiceLink  = htmlspecialchars($redirectUrl);
+    $invoiceLink  = htmlspecialchars($invoiceUrl);
     ?>
     <!DOCTYPE html>
     <html lang="id">
@@ -223,12 +377,12 @@ try {
                 </svg>
             </div>
             <h1>Gagal Memproses Pembayaran</h1>
-            <p class="desc">Terjadi kendala saat menghubungkan tagihan Anda ke gerbang pembayaran Aulaa.</p>
+            <p class="desc">Terjadi kendala saat menghubungkan tagihan Anda ke halaman pembayaran Aulaa.</p>
             <div class="error-box">
                 <strong>Detail Error:</strong><br>
                 <?= $errorMessage ?>
             </div>
-            <a href="<?= $invoiceLink ?>" class="btn">Kembali ke Invoice #<?= $invoiceId ?></a>
+            <a href="<?= $invoiceLink ?>" class="btn">Kembali ke Invoice #<?= (int)$invoiceId ?></a>
         </div>
     </body>
     </html>
