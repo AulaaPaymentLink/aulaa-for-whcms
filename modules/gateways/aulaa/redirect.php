@@ -115,6 +115,10 @@ try {
         $orderRef = ($attempt === 1) ? $baseOrderRef : $baseOrderRef . '-r' . $attempt;
 
         try {
+            // `payment_method` sengaja TIDAK dikirim, supaya pelanggan memilih
+            // sendiri metode pembayaran di halaman Aulaa dari metode yang aktif
+            // pada project. Mengisi field ini akan mengunci transaksi ke satu
+            // metode saja, jadi jangan ditambahkan di sini.
             $res = $api->createPayment([
                 'order_id'     => $orderRef,
                 'amount'       => $amount,

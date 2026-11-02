@@ -15,8 +15,6 @@ Aulaa adalah layanan **payment link**. Pembayaran selalu diselesaikan di **halam
 5. Pelanggan memilih metode dan membayar di halaman Aulaa.
 6. Aulaa mengirim **webhook** ke WHMCS; invoice otomatis ditandai **Paid**, lalu pelanggan dialihkan kembali ke halaman invoice.
 
-> **Perubahan penting (30 Oktober 2026).** Aulaa menghapus field `payment_number` dari response API dan menggantinya dengan `payment_link`. Nomor Virtual Account, string QRIS, link e-wallet, dan kode bayar gerai retail **tidak lagi dikirim lewat API** — semuanya ditampilkan oleh halaman pembayaran Aulaa. Modul ini (v1.1.0) mengambil URL pembayaran langsung dari field `payment_link` sesuai kontrak baru tersebut.
-
 ---
 
 ## Fitur Utama
